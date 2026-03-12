@@ -1,36 +1,38 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net"
+	"mime"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/gmail/v1"
-	"google.golang.org/api/option"
+	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-message/mail"
 )
 
 type Config struct {
+	GmailAddress []string `json:"gmail_address"`
+	AppPassword  string   `json:"app_password"`
 	AllowedUsers []string `json:"allowed_users"`
-	PrinterHost  string   `json:"printer_host"`
-	PrinterPort  int      `json:"printer_port"`
+	PrinterName  string   `json:"printer_name"` // CUPS printer name
 	OutputDir    string   `json:"output_directory"`
+	CleanupAfter bool     `json:"cleanup_after_print"` // Delete files after printing
 }
 
 var (
-	credentialsFile = flag.String("credentials", "credentials.json", "Path to service account credentials JSON file")
-	configFile      = flag.String("config", "config.json", "Path to configuration file")
-	printerName     = flag.String("printer", "", "Network printer name/address (overrides config)")
-	outputDir       = flag.String("output", "/tmp/print-attachments", "Output directory for attachments")
-	markAsRead      = flag.Bool("mark-read", false, "Mark processed emails as read")
-	dryRun          = flag.Bool("dry-run", false, "Show what would be printed without actually printing")
+	configFile  = flag.String("config", "config.json", "Path to configuration file")
+	printerName = flag.String("printer", "", "CUPS printer name (overrides config)")
+	outputDir   = flag.String("output", "./attachments", "Output directory for attachments")
+	dryRun      = flag.Bool("dry-run", false, "Show what would be printed without actually printing")
+	noCleanup   = flag.Bool("no-cleanup", false, "Don't delete files after printing")
+	verbose     = flag.Bool("verbose", false, "Verbose output")
 )
 
 func main() {
@@ -44,10 +46,13 @@ func main() {
 
 	// Override with command line flags
 	if *printerName != "" {
-		cfg.PrinterHost = *printerName
+		cfg.PrinterName = *printerName
 	}
 	if *outputDir != "" {
 		cfg.OutputDir = *outputDir
+	}
+	if *noCleanup {
+		cfg.CleanupAfter = false
 	}
 
 	// Create output directory
@@ -55,17 +60,26 @@ func main() {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	// Authenticate with Gmail
-	ctx := context.Background()
-	gmailService, err := authenticateGmail(ctx, *credentialsFile)
-	if err != nil {
-		log.Fatalf("Failed to authenticate with Gmail: %v", err)
+	// Verify CUPS is available
+	if !*dryRun && !cupsPrinterExists(cfg.PrinterName) {
+		log.Fatalf("CUPS printer '%s' not found. Available printers:", cfg.PrinterName)
+		listCupsPrinters()
+		os.Exit(1)
 	}
+
+	log.Println("Connecting to Gmail via IMAP...")
+
+	// Connect to Gmail IMAP
+	imapClient, err := connectIMAP(cfg.GmailAddress[0], cfg.AppPassword)
+	if err != nil {
+		log.Fatalf("Failed to connect to Gmail: %v", err)
+	}
+	defer imapClient.Logout()
 
 	log.Println("Successfully authenticated with Gmail")
 
-	// Get emails from allowed users
-	attachments, err := fetchAttachments(gmailService, cfg.AllowedUsers)
+	// Fetch attachments from allowed users
+	attachments, err := fetchAttachmentsIMAP(imapClient, cfg.AllowedUsers)
 	if err != nil {
 		log.Fatalf("Failed to fetch attachments: %v", err)
 	}
@@ -78,59 +92,53 @@ func main() {
 	log.Printf("Found %d attachments to process\n", len(attachments))
 
 	// Process each attachment
+	successCount := 0
 	for _, att := range attachments {
-		log.Printf("Processing: %s (Email ID: %s)\n", att.Filename, att.EmailID)
+		log.Printf("Processing: %s (From: %s, Email ID: %s)\n", att.Filename, att.From, att.EmailID)
 
-		// Save attachment
-		if err := saveAttachment(gmailService, att); err != nil {
-			log.Printf("Error saving attachment %s: %v\n", att.Filename, err)
-			continue
-		}
-
-		// Print attachment if dry-run is disabled
+		// Print attachment
 		if !*dryRun {
-			if err := printAttachment(att.LocalPath, cfg.PrinterHost, cfg.PrinterPort); err != nil {
+			if err := printAttachmentCUPS(att.LocalPath, cfg.PrinterName); err != nil {
 				log.Printf("Error printing %s: %v\n", att.Filename, err)
 				continue
 			}
-			log.Printf("Successfully printed: %s\n", att.Filename)
-		} else {
-			log.Printf("[DRY-RUN] Would print: %s to %s:%d\n", att.Filename, cfg.PrinterHost, cfg.PrinterPort)
-		}
+			log.Printf("Successfully sent to printer: %s\n", att.Filename)
+			successCount++
 
-		// Mark email as read if requested
-		if *markAsRead && !*dryRun {
-			if err := markEmailAsRead(gmailService, att.EmailID); err != nil {
-				log.Printf("Warning: Failed to mark email as read: %v\n", err)
+			// Delete file after successful printing
+			if cfg.CleanupAfter {
+				if err := os.Remove(att.LocalPath); err != nil {
+					log.Printf("Warning: Failed to delete %s: %v\n", att.LocalPath, err)
+				} else {
+					if *verbose {
+						log.Printf("Deleted: %s\n", att.LocalPath)
+					}
+				}
 			}
+		} else {
+			log.Printf("[DRY-RUN] Would print: %s to printer '%s'\n", att.Filename, cfg.PrinterName)
 		}
 	}
 
-	log.Println("Processing complete")
+	if !*dryRun {
+		log.Printf("Processing complete - %d/%d files printed successfully\n", successCount, len(attachments))
+	} else {
+		log.Println("Dry-run complete")
+	}
 }
 
-func authenticateGmail(ctx context.Context, credentialsPath string) (*gmail.Service, error) {
-	data, err := os.ReadFile(credentialsPath)
+func connectIMAP(email, appPassword string) (*client.Client, error) {
+	c, err := client.DialTLS("imap.gmail.com:993", nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read credentials file: %w", err)
+		return nil, fmt.Errorf("failed to connect to IMAP server: %w", err)
 	}
 
-	// For service account credentials
-	config, err := google.JWTConfigFromJSON(data, gmail.GmailReadonlyScope)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse credentials: %w", err)
+	if err := c.Login(email, appPassword); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("failed to login to IMAP: %w", err)
 	}
 
-	// Create HTTP client with JWT
-	httpClient := config.Client(ctx)
-
-	// Create Gmail service
-	service, err := gmail.NewService(ctx, option.WithHTTPClient(httpClient))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Gmail service: %w", err)
-	}
-
-	return service, nil
+	return c, nil
 }
 
 type Attachment struct {
@@ -143,167 +151,309 @@ type Attachment struct {
 	LocalPath string
 }
 
-func fetchAttachments(srv *gmail.Service, allowedUsers []string) ([]Attachment, error) {
+func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment, error) {
 	var attachments []Attachment
 
-	// Build query for allowed users
-	query := buildUserQuery(allowedUsers)
-	log.Printf("Searching with query: %s\n", query)
+	// Select INBOX
+	mbox, err := c.Select("INBOX", false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select INBOX: %w", err)
+	}
 
-	// List messages
-	call := srv.Users.Messages.List("me").Q(query).MaxResults(10)
+	if *verbose {
+		log.Printf("INBOX has %d messages\n", mbox.Messages)
+	}
 
-	for {
-		resp, err := call.Do()
-		if err != nil {
-			return nil, fmt.Errorf("failed to list messages: %w", err)
+	if mbox.Messages == 0 {
+		return attachments, nil
+	}
+
+	// Fetch all messages
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(1, mbox.Messages)
+
+	messages := make(chan *imap.Message, 10)
+	done := make(chan error, 1)
+
+	// Fetch messages with ENVELOPE and RFC822
+	go func() {
+		done <- c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
+	}()
+
+	// Process each message
+	for msg := range messages {
+		envelope := msg.Envelope
+		if envelope == nil {
+			continue
 		}
 
-		if resp.Messages == nil {
-			break
+		from := ""
+		if len(envelope.From) > 0 {
+			from = envelope.From[0].Address()
+		}
+		subject := envelope.Subject
+
+		// Check if sender is in allowed list
+		if !isAllowedUser(from, allowedUsers) {
+			continue
 		}
 
-		// Get details for each message
-		for _, msg := range resp.Messages {
-			message, err := srv.Users.Messages.Get("me", msg.Id).Format("full").Do()
-			if err != nil {
-				log.Printf("Failed to get message %s: %v\n", msg.Id, err)
-				continue
+		// Get the message body
+		literal := msg.GetBody(&imap.BodySectionName{})
+		if literal == nil {
+			continue
+		}
+
+		// Read from the imap.Literal reader
+		buf := new(bytes.Buffer)
+		if _, err := buf.ReadFrom(literal); err != nil {
+			if *verbose {
+				log.Printf("Failed to read message body: %v\n", err)
 			}
-
-			from := getHeaderValue(message.Payload.Headers, "From")
-			subject := getHeaderValue(message.Payload.Headers, "Subject")
-
-			// Extract attachments
-			att := extractMessageAttachments(srv, message, from, subject)
-			attachments = append(attachments, att...)
+			continue
 		}
 
-		// Check if there are more pages
-		if resp.NextPageToken == "" {
-			break
+		// Parse the message
+		mr, err := mail.CreateReader(buf)
+		if err != nil {
+			if *verbose {
+				log.Printf("Failed to parse message: %v\n", err)
+			}
+			continue
 		}
-		call.PageToken(resp.NextPageToken)
+
+		// Extract attachments from this message
+		atts := extractAttachmentsFromMessage(mr, msg.SeqNum, from, subject)
+		attachments = append(attachments, atts...)
+	}
+
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("failed to fetch messages: %w", err)
 	}
 
 	return attachments, nil
 }
 
-func extractMessageAttachments(srv *gmail.Service, message *gmail.Message, from, subject string) []Attachment {
+func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject string) []Attachment {
 	var attachments []Attachment
 
-	if message.Payload == nil {
-		return attachments
-	}
-
-	// Check for attachments in main payload
-	for _, part := range message.Payload.Parts {
-		if part.Filename != "" && part.Body.AttachmentId != "" {
-			att := Attachment{
-				EmailID:  message.Id,
-				From:     from,
-				Subject:  subject,
-				Filename: part.Filename,
-				MimeType: part.MimeType,
-				Size:     part.Body.Size,
-			}
-			attachments = append(attachments, att)
+	// Iterate through message parts
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			break
 		}
 
-		// Recursively check nested parts
-		nested := extractMessageAttachments(srv, &gmail.Message{Payload: part}, from, subject)
-		attachments = append(attachments, nested...)
+		// Get Content-Disposition header
+		disp := part.Header.Get("Content-Disposition")
+		if disp == "" {
+			continue
+		}
+
+		// Parse the disposition to check if it's an attachment
+		mediaType, params, err := mime.ParseMediaType(disp)
+		if err != nil {
+			continue
+		}
+
+		if mediaType != "attachment" {
+			continue
+		}
+
+		// Get filename from parameters
+		filename := params["filename"]
+		if filename == "" {
+			contentType := part.Header.Get("Content-Type")
+			if contentType != "" {
+				_, typeParams, _ := mime.ParseMediaType(contentType)
+				filename = typeParams["name"]
+			}
+		}
+
+		if filename == "" {
+			filename = "attachment"
+		}
+
+		// Read attachment content
+		buf := new(bytes.Buffer)
+		if _, err := buf.ReadFrom(part.Body); err != nil {
+			if *verbose {
+				log.Printf("Failed to read attachment: %v\n", err)
+			}
+			continue
+		}
+
+		// Save attachment
+		localPath := filepath.Join(*outputDir, filename)
+		if err := os.WriteFile(localPath, buf.Bytes(), 0644); err != nil {
+			if *verbose {
+				log.Printf("Failed to save attachment: %v\n", err)
+			}
+			continue
+		}
+
+		att := Attachment{
+			EmailID:   fmt.Sprintf("%d", seqNum),
+			From:      from,
+			Subject:   subject,
+			Filename:  filename,
+			MimeType:  part.Header.Get("Content-Type"),
+			Size:      int64(buf.Len()),
+			LocalPath: localPath,
+		}
+
+		attachments = append(attachments, att)
+		if *verbose {
+			log.Printf("Extracted attachment: %s (%d bytes)\n", filename, att.Size)
+		}
 	}
 
 	return attachments
 }
 
-func saveAttachment(srv *gmail.Service, att Attachment) error {
-	// Get attachment data
-	resp, err := srv.Users.Messages.Attachments.Get("me", att.EmailID, att.Filename).Do()
-	if err != nil {
-		return fmt.Errorf("failed to get attachment: %w", err)
-	}
-
-	// Decode the data
-	data := resp.Data
-	if data == "" {
-		return fmt.Errorf("empty attachment data")
-	}
-
-	// Save to file
-	localPath := filepath.Join(*outputDir, att.Filename)
-	if err := os.WriteFile(localPath, []byte(data), 0644); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	att.LocalPath = localPath
-	return nil
-}
-
-func printAttachment(filePath, printerHost string, printerPort int) error {
-	// Read file
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
-	}
-
-	// Connect to printer (raw socket connection for AppSocket/JetDirect)
-	// Use net.JoinHostPort to properly handle IPv6 addresses
-	addr := net.JoinHostPort(printerHost, strconv.Itoa(printerPort))
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to printer: %w", err)
-	}
-	defer conn.Close()
-
-	// Send file to printer
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("failed to send data to printer: %w", err)
-	}
-
-	return nil
-}
-
-func markEmailAsRead(srv *gmail.Service, messageID string) error {
-	// Remove UNREAD label
-	_, err := srv.Users.Messages.Modify("me", messageID, &gmail.ModifyMessageRequest{
-		RemoveLabelIds: []string{"UNREAD"},
-	}).Do()
-	return err
-}
-
-func buildUserQuery(allowedUsers []string) string {
+func isAllowedUser(sender string, allowedUsers []string) bool {
 	if len(allowedUsers) == 0 {
-		return "has:attachment"
+		return true
 	}
 
-	var conditions []string
-	for _, user := range allowedUsers {
-		conditions = append(conditions, fmt.Sprintf("from:%s", user))
-	}
-
-	query := strings.Join(conditions, " OR ")
-	return fmt.Sprintf("(%s) has:attachment", query)
-}
-
-func getHeaderValue(headers []*gmail.MessagePartHeader, name string) string {
-	for _, header := range headers {
-		if header.Name == name {
-			return header.Value
+	for _, allowed := range allowedUsers {
+		if strings.EqualFold(sender, allowed) ||
+			strings.EqualFold(sender, "<"+allowed+">") ||
+			strings.HasSuffix(sender, "@"+allowed) {
+			return true
 		}
 	}
-	return ""
+
+	return false
+}
+
+// printAttachmentCUPS sends file to CUPS printer with format handling
+func printAttachmentCUPS(filePath, printerName string) error {
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	// Handle DOCX files - convert to PDF first
+	if ext == ".docx" {
+		return printDocxViaCUPS(filePath, printerName)
+	}
+
+	// Handle PDF files directly
+	if ext == ".pdf" {
+		return printFileCUPS(filePath, printerName)
+	}
+
+	// For other formats, try to print directly
+	// CUPS may handle format conversion automatically
+	return printFileCUPS(filePath, printerName)
+}
+
+// printDocxViaCUPS converts DOCX to PDF and prints
+func printDocxViaCUPS(filePath, printerName string) error {
+	if *verbose {
+		log.Printf("Converting DOCX to PDF: %s\n", filePath)
+	}
+
+	// Check if libreoffice is available for conversion
+	pdfPath := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + ".pdf"
+
+	// Try to convert DOCX to PDF using libreoffice
+	cmd := exec.Command("libreoffice",
+		"--headless",
+		"--convert-to", "pdf",
+		"--outdir", filepath.Dir(filePath),
+		filePath,
+	)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Fallback: try to print DOCX directly
+		if *verbose {
+			log.Printf("LibreOffice conversion failed: %s. Attempting direct print.\n", string(output))
+		}
+		return printFileCUPS(filePath, printerName)
+	}
+
+	if *verbose {
+		log.Printf("DOCX converted to: %s\n", pdfPath)
+	}
+
+	// Print the converted PDF
+	if err := printFileCUPS(pdfPath, printerName); err != nil {
+		// Clean up converted PDF on error
+		os.Remove(pdfPath)
+		return err
+	}
+
+	// Clean up the temporary PDF file (keep original DOCX for cleanup later)
+	if *verbose {
+		log.Printf("Removing temporary PDF: %s\n", pdfPath)
+	}
+	os.Remove(pdfPath)
+
+	return nil
+}
+
+// printFileCUPS uses CUPS lp command to print a file
+func printFileCUPS(filePath, printerName string) error {
+	// Use CUPS 'lp' command for printing
+	// This is lightweight and optimized for embedded systems like Raspberry Pi
+	cmd := exec.Command("lp",
+		"-d", printerName, // Destination printer
+		"-n", "1", // Number of copies
+		"-q", "50", // Priority (0-100, 50=normal)
+		filePath,
+	)
+
+	// Capture output for debugging
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		// Parse CUPS error messages
+		errMsg := stderr.String()
+		if strings.Contains(errMsg, "not found") {
+			return fmt.Errorf("printer '%s' not found. Check CUPS configuration", printerName)
+		}
+		if strings.Contains(errMsg, "not accepting") {
+			return fmt.Errorf("printer '%s' is not accepting jobs", printerName)
+		}
+		return fmt.Errorf("CUPS lp command failed: %w (stderr: %s)", err, errMsg)
+	}
+
+	return nil
+}
+
+// cupsPrinterExists checks if a CUPS printer is available
+func cupsPrinterExists(printerName string) bool {
+	cmd := exec.Command("lpstat", "-p", "-d")
+	output, err := cmd.Output()
+	if err != nil {
+		if *verbose {
+			log.Printf("Failed to query CUPS printers: %v\n", err)
+		}
+		return false
+	}
+
+	return strings.Contains(string(output), printerName)
+}
+
+// listCupsPrinters lists all available CUPS printers
+func listCupsPrinters() {
+	cmd := exec.Command("lpstat", "-p", "-d")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Failed to list CUPS printers: %v\n", err)
+		return
+	}
+	fmt.Println(string(output))
 }
 
 func loadConfig(configPath string) (*Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		// Return default config if file doesn't exist
 		if os.IsNotExist(err) {
 			return &Config{
-				PrinterPort: 9100,
-				OutputDir:   *outputDir,
+				PrinterName:  "lp",
+				OutputDir:    *outputDir,
+				CleanupAfter: true,
 			}, nil
 		}
 		return nil, err
@@ -314,8 +464,12 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	if cfg.PrinterPort == 0 {
-		cfg.PrinterPort = 9100 // Default AppSocket port
+	if cfg.PrinterName == "" {
+		cfg.PrinterName = "lp" // Default to system default printer
+	}
+
+	if cfg.CleanupAfter == false {
+		cfg.CleanupAfter = true // Default to cleanup
 	}
 
 	return &cfg, nil
