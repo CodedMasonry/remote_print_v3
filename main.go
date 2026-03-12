@@ -468,9 +468,5 @@ func loadConfig(configPath string) (*Config, error) {
 		cfg.PrinterName = "lp" // Default to system default printer
 	}
 
-	if cfg.CleanupAfter == false {
-		cfg.CleanupAfter = true // Default to cleanup
-	}
-
 	return &cfg, nil
 }
