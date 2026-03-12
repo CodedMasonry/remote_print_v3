@@ -29,7 +29,7 @@ type Config struct {
 var (
 	configFile  = flag.String("config", "config.json", "Path to configuration file")
 	printerName = flag.String("printer", "", "CUPS printer name (overrides config)")
-	outputDir   = flag.String("output", "./attachments", "Output directory for attachments")
+	outputDir   = flag.String("output", "/tmp/remote_print_attachments", "Output directory for attachments")
 	dryRun      = flag.Bool("dry-run", false, "Show what would be printed without actually printing")
 	noCleanup   = flag.Bool("no-cleanup", false, "Don't delete files after printing")
 	verbose     = flag.Bool("verbose", false, "Verbose output")

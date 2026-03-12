@@ -3,6 +3,6 @@
   "app_password": "xxxx xxxx xxxx xxxx",
   "allowed_users": ["sender1@example.com", "sender2@example.com"],
   "printer_name": "Brother_HL_L8360CDW",
-  "output_directory": "./attachments",
+  "output_directory": "/tmp/remote_print_attachments",
   "cleanup_after_print": true
 }
