@@ -1,0 +1,9 @@
+[Unit]
+Description=Remotes Printer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/remote_printer -config /opt/remote_printer/config.json
+
+[Install]
+WantedBy=multi-user.target

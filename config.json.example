@@ -1,0 +1,6 @@
+{
+  "allowed_users": ["user1@example.com", "user2@example.com"],
+  "printer_host": "192.168.1.100",
+  "printer_port": 9100,
+  "output_directory": "/tmp/print-attachments"
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Remote Printer Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
