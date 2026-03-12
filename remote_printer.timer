@@ -1,9 +1,11 @@
 [Unit]
-Description=Remote Printer Timer
+Description=Gmail Printer Timer
+Requires=remote_printer.service
 
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=15min
+Persistent=true
 
 [Install]
 WantedBy=timers.target

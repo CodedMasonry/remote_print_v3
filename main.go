@@ -105,6 +105,13 @@ func main() {
 			log.Printf("Successfully sent to printer: %s\n", att.Filename)
 			successCount++
 
+			// Mark the source email as read so it's skipped on next run
+			if err := markMessageSeen(imapClient, att.SeqNum); err != nil {
+				log.Printf("Warning: failed to mark email %s as seen: %v\n", att.EmailID, err)
+			} else if *verbose {
+				log.Printf("Marked email %s as seen\n", att.EmailID)
+			}
+
 			// Delete file after successful printing
 			if cfg.CleanupAfter {
 				if err := os.Remove(att.LocalPath); err != nil {
@@ -142,6 +149,7 @@ func connectIMAP(email, appPassword string) (*client.Client, error) {
 }
 
 type Attachment struct {
+	SeqNum    uint32
 	EmailID   string
 	From      string
 	Subject   string
@@ -168,9 +176,27 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 		return attachments, nil
 	}
 
-	// Fetch all messages
+	// Search for UNSEEN messages only
+	criteria := imap.NewSearchCriteria()
+	criteria.WithoutFlags = []string{imap.SeenFlag}
+	unseenIds, err := c.Search(criteria)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search for unseen messages: %w", err)
+	}
+
+	if len(unseenIds) == 0 {
+		if *verbose {
+			log.Println("No unseen messages found")
+		}
+		return attachments, nil
+	}
+
+	if *verbose {
+		log.Printf("Found %d unseen messages\n", len(unseenIds))
+	}
+
 	seqSet := new(imap.SeqSet)
-	seqSet.AddRange(1, mbox.Messages)
+	seqSet.AddNum(unseenIds...)
 
 	messages := make(chan *imap.Message, 10)
 	done := make(chan error, 1)
@@ -293,6 +319,7 @@ func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject
 		}
 
 		att := Attachment{
+			SeqNum:    seqNum,
 			EmailID:   fmt.Sprintf("%d", seqNum),
 			From:      from,
 			Subject:   subject,
@@ -325,6 +352,15 @@ func isAllowedUser(sender string, allowedUsers []string) bool {
 	}
 
 	return false
+}
+
+// markMessageSeen sets the \Seen flag on a message so it's skipped on future runs
+func markMessageSeen(c *client.Client, seqNum uint32) error {
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(seqNum)
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []any{imap.SeenFlag}
+	return c.Store(seqSet, item, flags, nil)
 }
 
 // printAttachmentCUPS sends file to CUPS printer with format handling

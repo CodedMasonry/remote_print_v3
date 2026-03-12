@@ -1,9 +1,16 @@
 [Unit]
-Description=Remotes Printer
+Description=Gmail Attachment Printer
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/remote_printer -config /opt/remote_printer/config.json
+User=pi
+WorkingDirectory=/home/pi/remote_print_v3
+ExecStart=/home/pi/remote_print_v3/remote_print_v3 -config /home/pi/remote_print_v3/config.json
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=remote_printer
 
 [Install]
 WantedBy=multi-user.target
