@@ -103,56 +103,103 @@ func main() {
 
 	log.Printf("Found %d attachments to process\n", len(attachments))
 
-	successCount := 0
+	// Group attachments by email (SeqNum uniquely identifies an email in a session).
+	type emailBatch struct {
+		from        string
+		subject     string
+		seqNum      uint32
+		attachments []Attachment
+	}
+
+	batchMap := make(map[uint32]*emailBatch)
+	var batchOrder []uint32 // preserve arrival order
+
 	for _, att := range attachments {
-		log.Printf("Processing: %s (From: %s, Email ID: %s)\n", att.Filename, att.From, att.EmailID)
-
-		// Reject unsupported file types and notify the sender.
-		ext := strings.ToLower(filepath.Ext(att.Filename))
-		if !supportedExtensions[ext] {
-			log.Printf("Unsupported file type '%s' from %s — notifying sender\n", ext, att.From)
-			if !*dryRun {
-				if err := sendUnsupportedTypeReply(cfg, att); err != nil {
-					log.Printf("Warning: failed to send unsupported-type reply to %s: %v\n", att.From, err)
-				}
-				// Still mark the email seen so we don't re-process it.
-				if err := markMessageSeen(imapClient, att.SeqNum); err != nil {
-					log.Printf("Warning: failed to mark email %s as seen: %v\n", att.EmailID, err)
-				}
-			} else {
-				log.Printf("[DRY-RUN] Would notify %s that '%s' is unsupported\n", att.From, att.Filename)
+		if _, exists := batchMap[att.SeqNum]; !exists {
+			batchMap[att.SeqNum] = &emailBatch{
+				from:    att.From,
+				subject: att.Subject,
+				seqNum:  att.SeqNum,
 			}
-			continue
+			batchOrder = append(batchOrder, att.SeqNum)
 		}
+		batchMap[att.SeqNum].attachments = append(batchMap[att.SeqNum].attachments, att)
+	}
 
-		if !*dryRun {
-			if err := printAttachmentCUPS(att.LocalPath, cfg.PrinterName); err != nil {
-				log.Printf("Error printing %s: %v\n", att.Filename, err)
+	totalSuccess := 0
+	totalFiles := len(attachments)
+
+	for _, seqNum := range batchOrder {
+		batch := batchMap[seqNum]
+		log.Printf("Processing batch from %s (subject: %q, %d file(s))\n",
+			batch.from, batch.subject, len(batch.attachments))
+
+		var printed []string // filenames successfully printed this batch
+		var skipped []string // filenames skipped due to unsupported type
+		var failed []string  // filenames that failed to print
+
+		for _, att := range batch.attachments {
+			log.Printf("  Processing: %s\n", att.Filename)
+
+			ext := strings.ToLower(filepath.Ext(att.Filename))
+			if !supportedExtensions[ext] {
+				log.Printf("  Unsupported file type '%s' from %s — notifying sender\n", ext, att.From)
+				if !*dryRun {
+					if err := sendUnsupportedTypeReply(cfg, att); err != nil {
+						log.Printf("  Warning: failed to send unsupported-type reply to %s: %v\n", att.From, err)
+					}
+				} else {
+					log.Printf("  [DRY-RUN] Would notify %s that '%s' is unsupported\n", att.From, att.Filename)
+				}
+				skipped = append(skipped, att.Filename)
 				continue
 			}
-			log.Printf("Successfully sent to printer: %s\n", att.Filename)
-			successCount++
 
-			if err := markMessageSeen(imapClient, att.SeqNum); err != nil {
-				log.Printf("Warning: failed to mark email %s as seen: %v\n", att.EmailID, err)
+			if !*dryRun {
+				if err := printAttachmentCUPS(att.LocalPath, cfg.PrinterName); err != nil {
+					log.Printf("  Error printing %s: %v\n", att.Filename, err)
+					failed = append(failed, att.Filename)
+					continue
+				}
+				log.Printf("  Successfully sent to printer: %s\n", att.Filename)
+				printed = append(printed, att.Filename)
+				totalSuccess++
+
+				if cfg.CleanupAfter {
+					if err := os.Remove(att.LocalPath); err != nil {
+						log.Printf("  Warning: Failed to delete %s: %v\n", att.LocalPath, err)
+					} else if *verbose {
+						log.Printf("  Deleted: %s\n", att.LocalPath)
+					}
+				}
+			} else {
+				log.Printf("  [DRY-RUN] Would print: %s to printer '%s'\n", att.Filename, cfg.PrinterName)
+				printed = append(printed, att.Filename)
+			}
+		}
+
+		// Mark email seen and send batch confirmation once all files are processed.
+		if !*dryRun {
+			if err := markMessageSeen(imapClient, seqNum); err != nil {
+				log.Printf("Warning: failed to mark email %d as seen: %v\n", seqNum, err)
 			} else if *verbose {
-				log.Printf("Marked email %s as seen\n", att.EmailID)
+				log.Printf("Marked email %d as seen\n", seqNum)
 			}
 
-			if cfg.CleanupAfter {
-				if err := os.Remove(att.LocalPath); err != nil {
-					log.Printf("Warning: Failed to delete %s: %v\n", att.LocalPath, err)
-				} else if *verbose {
-					log.Printf("Deleted: %s\n", att.LocalPath)
+			// Only send a confirmation if at least one file printed successfully.
+			if len(printed) > 0 {
+				if err := sendBatchConfirmation(cfg, batch.from, batch.subject, printed, skipped, failed); err != nil {
+					log.Printf("Warning: failed to send batch confirmation to %s: %v\n", batch.from, err)
 				}
 			}
-		} else {
-			log.Printf("[DRY-RUN] Would print: %s to printer '%s'\n", att.Filename, cfg.PrinterName)
+		} else if len(printed) > 0 {
+			log.Printf("[DRY-RUN] Would send batch confirmation to %s for %d printed file(s)\n",
+				batch.from, len(printed))
 		}
 	}
 
 	if !*dryRun {
-		log.Printf("Processing complete - %d/%d files printed successfully\n", successCount, len(attachments))
+		log.Printf("Processing complete — %d/%d files printed successfully\n", totalSuccess, totalFiles)
 	} else {
 		log.Println("Dry-run complete")
 	}
@@ -477,9 +524,67 @@ func printFileCUPS(filePath, printerName string) error {
 	return nil
 }
 
+// sendBatchConfirmation emails the sender a summary of what was printed once
+// all files from their email have been processed.
+func sendBatchConfirmation(cfg *Config, to, originalSubject string, printed, skipped, failed []string) error {
+	from := cfg.GmailAddress[0]
+	subject := fmt.Sprintf("Re: %s", originalSubject)
+
+	var sb strings.Builder
+	sb.WriteString("Hi,\n\n")
+
+	if len(printed) == 1 {
+		sb.WriteString(fmt.Sprintf("Your file has been sent to the printer successfully:\n\n"))
+	} else {
+		sb.WriteString(fmt.Sprintf("All %d files from your email have been sent to the printer successfully:\n\n", len(printed)))
+	}
+	for _, f := range printed {
+		sb.WriteString(fmt.Sprintf("  ✓ %s\n", f))
+	}
+
+	if len(skipped) > 0 {
+		sb.WriteString("\nThe following file(s) were skipped due to unsupported format:\n\n")
+		for _, f := range skipped {
+			sb.WriteString(fmt.Sprintf("  ✗ %s\n", f))
+		}
+		sb.WriteString("\nSupported types: PDF, DOCX, DOC, JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP\n")
+	}
+
+	if len(failed) > 0 {
+		sb.WriteString("\nThe following file(s) failed to print:\n\n")
+		for _, f := range failed {
+			sb.WriteString(fmt.Sprintf("  ✗ %s\n", f))
+		}
+		sb.WriteString("\nPlease re-send the failed file(s) to try again.\n")
+	}
+
+	sb.WriteString("\n— Remote Print Server\n")
+
+	msg := "From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n" +
+		"\r\n" +
+		sb.String()
+
+	auth := smtp.PlainAuth("", from, cfg.AppPassword, "smtp.gmail.com")
+	if err := smtp.SendMail("smtp.gmail.com:587", auth, from, []string{to}, []byte(msg)); err != nil {
+		return fmt.Errorf("smtp.SendMail: %w", err)
+	}
+
+	log.Printf("Sent batch confirmation to %s (%d printed, %d skipped, %d failed)\n",
+		to, len(printed), len(skipped), len(failed))
+	return nil
+}
+
 // sendUnsupportedTypeReply emails the sender to let them know their file
 // type cannot be printed. It reuses the Gmail app-password credentials
 // already present in the config.
+//
+// Note: this is still used for standalone unsupported-file emails (i.e. an
+// email whose ONLY attachment is unsupported). For mixed batches the
+// sendBatchConfirmation summary covers the skipped files instead.
 func sendUnsupportedTypeReply(cfg *Config, att Attachment) error {
 	from := cfg.GmailAddress[0]
 	to := att.From
