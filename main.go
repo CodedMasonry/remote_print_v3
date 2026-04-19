@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"mime"
+	"net/smtp"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,9 +22,9 @@ type Config struct {
 	GmailAddress []string `json:"gmail_address"`
 	AppPassword  string   `json:"app_password"`
 	AllowedUsers []string `json:"allowed_users"`
-	PrinterName  string   `json:"printer_name"` // CUPS printer name
+	PrinterName  string   `json:"printer_name"`
 	OutputDir    string   `json:"output_directory"`
-	CleanupAfter bool     `json:"cleanup_after_print"` // Delete files after printing
+	CleanupAfter bool     `json:"cleanup_after_print"`
 }
 
 var (
@@ -35,16 +36,31 @@ var (
 	verbose     = flag.Bool("verbose", false, "Verbose output")
 )
 
+// supportedExtensions lists file types we can print.
+// Images are handled via ImageMagick convert -> PDF.
+// DOCX is handled via LibreOffice -> PDF.
+var supportedExtensions = map[string]bool{
+	".pdf":  true,
+	".docx": true,
+	".doc":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".png":  true,
+	".gif":  true,
+	".bmp":  true,
+	".tiff": true,
+	".tif":  true,
+	".webp": true,
+}
+
 func main() {
 	flag.Parse()
 
-	// Load configuration
 	cfg, err := loadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Override with command line flags
 	if *printerName != "" {
 		cfg.PrinterName = *printerName
 	}
@@ -55,12 +71,10 @@ func main() {
 		cfg.CleanupAfter = false
 	}
 
-	// Create output directory
 	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	// Verify CUPS is available
 	if !*dryRun && !cupsPrinterExists(cfg.PrinterName) {
 		log.Fatalf("CUPS printer '%s' not found. Available printers:", cfg.PrinterName)
 		listCupsPrinters()
@@ -69,7 +83,6 @@ func main() {
 
 	log.Println("Connecting to Gmail via IMAP...")
 
-	// Connect to Gmail IMAP
 	imapClient, err := connectIMAP(cfg.GmailAddress[0], cfg.AppPassword)
 	if err != nil {
 		log.Fatalf("Failed to connect to Gmail: %v", err)
@@ -78,8 +91,7 @@ func main() {
 
 	log.Println("Successfully authenticated with Gmail")
 
-	// Fetch attachments from allowed users
-	attachments, err := fetchAttachmentsIMAP(imapClient, cfg.AllowedUsers)
+	attachments, err := fetchAttachmentsIMAP(imapClient, cfg)
 	if err != nil {
 		log.Fatalf("Failed to fetch attachments: %v", err)
 	}
@@ -91,12 +103,28 @@ func main() {
 
 	log.Printf("Found %d attachments to process\n", len(attachments))
 
-	// Process each attachment
 	successCount := 0
 	for _, att := range attachments {
 		log.Printf("Processing: %s (From: %s, Email ID: %s)\n", att.Filename, att.From, att.EmailID)
 
-		// Print attachment
+		// Reject unsupported file types and notify the sender.
+		ext := strings.ToLower(filepath.Ext(att.Filename))
+		if !supportedExtensions[ext] {
+			log.Printf("Unsupported file type '%s' from %s — notifying sender\n", ext, att.From)
+			if !*dryRun {
+				if err := sendUnsupportedTypeReply(cfg, att); err != nil {
+					log.Printf("Warning: failed to send unsupported-type reply to %s: %v\n", att.From, err)
+				}
+				// Still mark the email seen so we don't re-process it.
+				if err := markMessageSeen(imapClient, att.SeqNum); err != nil {
+					log.Printf("Warning: failed to mark email %s as seen: %v\n", att.EmailID, err)
+				}
+			} else {
+				log.Printf("[DRY-RUN] Would notify %s that '%s' is unsupported\n", att.From, att.Filename)
+			}
+			continue
+		}
+
 		if !*dryRun {
 			if err := printAttachmentCUPS(att.LocalPath, cfg.PrinterName); err != nil {
 				log.Printf("Error printing %s: %v\n", att.Filename, err)
@@ -105,21 +133,17 @@ func main() {
 			log.Printf("Successfully sent to printer: %s\n", att.Filename)
 			successCount++
 
-			// Mark the source email as read so it's skipped on next run
 			if err := markMessageSeen(imapClient, att.SeqNum); err != nil {
 				log.Printf("Warning: failed to mark email %s as seen: %v\n", att.EmailID, err)
 			} else if *verbose {
 				log.Printf("Marked email %s as seen\n", att.EmailID)
 			}
 
-			// Delete file after successful printing
 			if cfg.CleanupAfter {
 				if err := os.Remove(att.LocalPath); err != nil {
 					log.Printf("Warning: Failed to delete %s: %v\n", att.LocalPath, err)
-				} else {
-					if *verbose {
-						log.Printf("Deleted: %s\n", att.LocalPath)
-					}
+				} else if *verbose {
+					log.Printf("Deleted: %s\n", att.LocalPath)
 				}
 			}
 		} else {
@@ -139,12 +163,10 @@ func connectIMAP(email, appPassword string) (*client.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to IMAP server: %w", err)
 	}
-
 	if err := c.Login(email, appPassword); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("failed to login to IMAP: %w", err)
 	}
-
 	return c, nil
 }
 
@@ -159,10 +181,9 @@ type Attachment struct {
 	LocalPath string
 }
 
-func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment, error) {
+func fetchAttachmentsIMAP(c *client.Client, cfg *Config) ([]Attachment, error) {
 	var attachments []Attachment
 
-	// Select INBOX
 	mbox, err := c.Select("INBOX", false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to select INBOX: %w", err)
@@ -176,7 +197,6 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 		return attachments, nil
 	}
 
-	// Search for UNSEEN messages only
 	criteria := imap.NewSearchCriteria()
 	criteria.WithoutFlags = []string{imap.SeenFlag}
 	unseenIds, err := c.Search(criteria)
@@ -201,12 +221,10 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 	messages := make(chan *imap.Message, 10)
 	done := make(chan error, 1)
 
-	// Fetch messages with ENVELOPE and RFC822
 	go func() {
 		done <- c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
 	}()
 
-	// Process each message
 	for msg := range messages {
 		envelope := msg.Envelope
 		if envelope == nil {
@@ -219,18 +237,15 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 		}
 		subject := envelope.Subject
 
-		// Check if sender is in allowed list
-		if !isAllowedUser(from, allowedUsers) {
+		if !isAllowedUser(from, cfg.AllowedUsers) {
 			continue
 		}
 
-		// Get the message body
 		literal := msg.GetBody(&imap.BodySectionName{})
 		if literal == nil {
 			continue
 		}
 
-		// Read from the imap.Literal reader
 		buf := new(bytes.Buffer)
 		if _, err := buf.ReadFrom(literal); err != nil {
 			if *verbose {
@@ -239,7 +254,6 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 			continue
 		}
 
-		// Parse the message
 		mr, err := mail.CreateReader(buf)
 		if err != nil {
 			if *verbose {
@@ -248,7 +262,6 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 			continue
 		}
 
-		// Extract attachments from this message
 		atts := extractAttachmentsFromMessage(mr, msg.SeqNum, from, subject)
 		attachments = append(attachments, atts...)
 	}
@@ -263,20 +276,17 @@ func fetchAttachmentsIMAP(c *client.Client, allowedUsers []string) ([]Attachment
 func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject string) []Attachment {
 	var attachments []Attachment
 
-	// Iterate through message parts
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
 			break
 		}
 
-		// Get Content-Disposition header
 		disp := part.Header.Get("Content-Disposition")
 		if disp == "" {
 			continue
 		}
 
-		// Parse the disposition to check if it's an attachment
 		mediaType, params, err := mime.ParseMediaType(disp)
 		if err != nil {
 			continue
@@ -286,7 +296,6 @@ func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject
 			continue
 		}
 
-		// Get filename from parameters
 		filename := params["filename"]
 		if filename == "" {
 			contentType := part.Header.Get("Content-Type")
@@ -295,12 +304,10 @@ func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject
 				filename = typeParams["name"]
 			}
 		}
-
 		if filename == "" {
 			filename = "attachment"
 		}
 
-		// Read attachment content
 		buf := new(bytes.Buffer)
 		if _, err := buf.ReadFrom(part.Body); err != nil {
 			if *verbose {
@@ -309,7 +316,6 @@ func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject
 			continue
 		}
 
-		// Save attachment
 		localPath := filepath.Join(*outputDir, filename)
 		if err := os.WriteFile(localPath, buf.Bytes(), 0644); err != nil {
 			if *verbose {
@@ -342,7 +348,6 @@ func isAllowedUser(sender string, allowedUsers []string) bool {
 	if len(allowedUsers) == 0 {
 		return true
 	}
-
 	for _, allowed := range allowedUsers {
 		if strings.EqualFold(sender, allowed) ||
 			strings.EqualFold(sender, "<"+allowed+">") ||
@@ -350,11 +355,9 @@ func isAllowedUser(sender string, allowedUsers []string) bool {
 			return true
 		}
 	}
-
 	return false
 }
 
-// markMessageSeen sets the \Seen flag on a message so it's skipped on future runs
 func markMessageSeen(c *client.Client, seqNum uint32) error {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(seqNum)
@@ -363,44 +366,72 @@ func markMessageSeen(c *client.Client, seqNum uint32) error {
 	return c.Store(seqSet, item, flags, nil)
 }
 
-// printAttachmentCUPS sends file to CUPS printer with format handling
+// printAttachmentCUPS dispatches to the correct handler based on file type.
 func printAttachmentCUPS(filePath, printerName string) error {
 	ext := strings.ToLower(filepath.Ext(filePath))
-
-	// Handle DOCX files - convert to PDF first
-	if ext == ".docx" {
+	switch ext {
+	case ".docx", ".doc":
 		return printDocxViaCUPS(filePath, printerName)
-	}
-
-	// Handle PDF files directly
-	if ext == ".pdf" {
+	case ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp":
+		return printImageViaCUPS(filePath, printerName)
+	default:
+		// PDF and anything else CUPS can handle natively.
 		return printFileCUPS(filePath, printerName)
 	}
-
-	// For other formats, try to print directly
-	// CUPS may handle format conversion automatically
-	return printFileCUPS(filePath, printerName)
 }
 
-// printDocxViaCUPS converts DOCX to PDF and prints
-func printDocxViaCUPS(filePath, printerName string) error {
+// printImageViaCUPS converts an image to PDF via ImageMagick's `convert`
+// and then sends it to CUPS. This avoids CUPS driver quirks with raw images
+// on Raspberry Pi and gives consistent, margin-safe output.
+func printImageViaCUPS(filePath, printerName string) error {
+	pdfPath := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + "_img.pdf"
+
 	if *verbose {
-		log.Printf("Converting DOCX to PDF: %s\n", filePath)
+		log.Printf("Converting image to PDF via ImageMagick: %s -> %s\n", filePath, pdfPath)
 	}
 
-	// Check if libreoffice is available for conversion
+	// -auto-orient  : respect EXIF rotation (important for phone photos)
+	// -quality 95   : preserve quality before PDF compression
+	// -compress jpeg: keeps file size reasonable on the Pi
+	cmd := exec.Command("convert",
+		"-auto-orient",
+		"-quality", "95",
+		"-compress", "jpeg",
+		filePath,
+		pdfPath,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ImageMagick convert failed for %s: %w (output: %s)", filePath, err, string(output))
+	}
+
+	if *verbose {
+		log.Printf("Image converted to PDF: %s\n", pdfPath)
+	}
+
+	if err := printFileCUPS(pdfPath, printerName); err != nil {
+		os.Remove(pdfPath)
+		return err
+	}
+
+	os.Remove(pdfPath)
+	return nil
+}
+
+// printDocxViaCUPS converts DOCX to PDF via LibreOffice and then prints.
+func printDocxViaCUPS(filePath, printerName string) error {
+	if *verbose {
+		log.Printf("Converting DOCX to PDF via LibreOffice: %s\n", filePath)
+	}
+
 	pdfPath := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + ".pdf"
 
-	// Try to convert DOCX to PDF using libreoffice
 	cmd := exec.Command("libreoffice",
 		"--headless",
 		"--convert-to", "pdf",
 		"--outdir", filepath.Dir(filePath),
 		filePath,
 	)
-
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// Fallback: try to print DOCX directly
 		if *verbose {
 			log.Printf("LibreOffice conversion failed: %s. Attempting direct print.\n", string(output))
 		}
@@ -411,39 +442,28 @@ func printDocxViaCUPS(filePath, printerName string) error {
 		log.Printf("DOCX converted to: %s\n", pdfPath)
 	}
 
-	// Print the converted PDF
 	if err := printFileCUPS(pdfPath, printerName); err != nil {
-		// Clean up converted PDF on error
 		os.Remove(pdfPath)
 		return err
 	}
 
-	// Clean up the temporary PDF file (keep original DOCX for cleanup later)
-	if *verbose {
-		log.Printf("Removing temporary PDF: %s\n", pdfPath)
-	}
 	os.Remove(pdfPath)
-
 	return nil
 }
 
-// printFileCUPS uses CUPS lp command to print a file
+// printFileCUPS sends a file directly to CUPS via `lp`.
 func printFileCUPS(filePath, printerName string) error {
-	// Use CUPS 'lp' command for printing
-	// This is lightweight and optimized for embedded systems like Raspberry Pi
 	cmd := exec.Command("lp",
-		"-d", printerName, // Destination printer
-		"-n", "1", // Number of copies
-		"-q", "50", // Priority (0-100, 50=normal)
+		"-d", printerName,
+		"-n", "1",
+		"-q", "50",
 		filePath,
 	)
 
-	// Capture output for debugging
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		// Parse CUPS error messages
 		errMsg := stderr.String()
 		if strings.Contains(errMsg, "not found") {
 			return fmt.Errorf("printer '%s' not found. Check CUPS configuration", printerName)
@@ -457,7 +477,38 @@ func printFileCUPS(filePath, printerName string) error {
 	return nil
 }
 
-// cupsPrinterExists checks if a CUPS printer is available
+// sendUnsupportedTypeReply emails the sender to let them know their file
+// type cannot be printed. It reuses the Gmail app-password credentials
+// already present in the config.
+func sendUnsupportedTypeReply(cfg *Config, att Attachment) error {
+	from := cfg.GmailAddress[0]
+	to := att.From
+	subject := fmt.Sprintf("Re: %s", att.Subject)
+	body := fmt.Sprintf(
+		"Hi,\n\n"+
+			"\"%s\" is an unsupported file type and could not be printed.\n\n"+
+			"Supported types: PDF, DOCX, DOC, JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP\n\n"+
+			"Please re-send as one of the supported formats.\n",
+		att.Filename,
+	)
+
+	msg := "From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n" +
+		"\r\n" +
+		body
+
+	auth := smtp.PlainAuth("", from, cfg.AppPassword, "smtp.gmail.com")
+	if err := smtp.SendMail("smtp.gmail.com:587", auth, from, []string{to}, []byte(msg)); err != nil {
+		return fmt.Errorf("smtp.SendMail: %w", err)
+	}
+
+	log.Printf("Sent unsupported-type reply to %s for file '%s'\n", to, att.Filename)
+	return nil
+}
+
 func cupsPrinterExists(printerName string) bool {
 	cmd := exec.Command("lpstat", "-p", "-d")
 	output, err := cmd.Output()
@@ -467,11 +518,9 @@ func cupsPrinterExists(printerName string) bool {
 		}
 		return false
 	}
-
 	return strings.Contains(string(output), printerName)
 }
 
-// listCupsPrinters lists all available CUPS printers
 func listCupsPrinters() {
 	cmd := exec.Command("lpstat", "-p", "-d")
 	output, err := cmd.Output()
@@ -501,7 +550,7 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	if cfg.PrinterName == "" {
-		cfg.PrinterName = "lp" // Default to system default printer
+		cfg.PrinterName = "lp"
 	}
 
 	return &cfg, nil
