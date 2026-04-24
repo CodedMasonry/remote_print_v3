@@ -322,6 +322,7 @@ func fetchAttachmentsIMAP(c *client.Client, cfg *Config) ([]Attachment, error) {
 
 func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject string) []Attachment {
 	var attachments []Attachment
+	var wordDec mime.WordDecoder
 
 	for {
 		part, err := mr.NextPart()
@@ -351,6 +352,14 @@ func extractAttachmentsFromMessage(mr *mail.Reader, seqNum uint32, from, subject
 				filename = typeParams["name"]
 			}
 		}
+
+		// Decode RFC 2047 MIME encoded filenames (e.g. =?UTF-8?B?...?=).
+		// Gmail encodes non-ASCII and long filenames this way, which causes
+		// filepath.Ext to return "" and the file to be treated as unsupported.
+		if decoded, err := wordDec.DecodeHeader(filename); err == nil {
+			filename = decoded
+		}
+
 		if filename == "" {
 			filename = "attachment"
 		}
@@ -531,10 +540,9 @@ func sendBatchConfirmation(cfg *Config, to, originalSubject string, printed, ski
 	subject := fmt.Sprintf("Re: %s", originalSubject)
 
 	var sb strings.Builder
-	sb.WriteString("Hi,\n\n")
 
 	if len(printed) == 1 {
-		sb.WriteString(fmt.Sprintf("Your file has been sent to the printer successfully:\n\n"))
+		sb.WriteString("Your file has been sent to the printer successfully:\n\n")
 	} else {
 		sb.WriteString(fmt.Sprintf("All %d files from your email have been sent to the printer successfully:\n\n", len(printed)))
 	}
@@ -578,20 +586,13 @@ func sendBatchConfirmation(cfg *Config, to, originalSubject string, printed, ski
 	return nil
 }
 
-// sendUnsupportedTypeReply emails the sender to let them know their file
-// type cannot be printed. It reuses the Gmail app-password credentials
-// already present in the config.
-//
-// Note: this is still used for standalone unsupported-file emails (i.e. an
-// email whose ONLY attachment is unsupported). For mixed batches the
-// sendBatchConfirmation summary covers the skipped files instead.
+// sendUnsupportedTypeReply notifies the sender their file type cannot be printed.
 func sendUnsupportedTypeReply(cfg *Config, att Attachment) error {
 	from := cfg.GmailAddress[0]
 	to := att.From
 	subject := fmt.Sprintf("Re: %s", att.Subject)
 	body := fmt.Sprintf(
-		"Hi,\n\n"+
-			"\"%s\" is an unsupported file type and could not be printed.\n\n"+
+		"\"%s\" is an unsupported file type and could not be printed.\n\n"+
 			"Supported types: PDF, DOCX, DOC, JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP\n\n"+
 			"Please re-send as one of the supported formats.\n",
 		att.Filename,
